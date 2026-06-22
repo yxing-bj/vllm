@@ -320,6 +320,11 @@ class InputBatch:
     ) -> int:
         req_index = self._register_add_request(request)
 
+        # NOTE(yxing): a reused slot may still hold the previous request's last
+        # decode hidden state. PLT prefill position 0 in iter>=1 expects 0 here.
+        if self.plt_loop_nums > 1:
+            self.plt_saved_hidden_states[:, req_index].fill_(0)
+
         req_id = request.req_id
         if req_index == len(self._req_ids):
             self._req_ids.append(req_id)
@@ -677,6 +682,8 @@ class InputBatch:
             self._req_ids.clear()
             self.req_output_token_ids.clear()
             self.spec_token_ids.clear()
+            if self.plt_loop_nums > 1:
+                self.plt_saved_hidden_states.fill_(0)
             return
 
         # NOTE(woosuk): This function assumes that the empty_req_indices

@@ -3651,6 +3651,10 @@ class GPUModelRunner(
         ):
             if self.plt_loop_nums > 1:
                 plt_last_model_output = None
+                # NOTE(yxing): cuda graph capture sizes can exceed the actual
+                # number of scheduled tokens. Zero the slice we are about to
+                # use so padded positions don't carry stale data across batches.
+                self.plt_loop_hidden_states[:, :num_tokens_padded].fill_(0)
                 # NOTE(yxing): this is a naive plt implementation
                 self._fill_first_hidden_state_for_plt(
                     schedule_tokens_np=num_scheduled_tokens_np
