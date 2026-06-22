@@ -10,7 +10,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import reduce
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
@@ -45,6 +45,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -538,6 +539,17 @@ class GPUModelRunner(
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
         self.comm_stream = torch.cuda.Stream()
+
+        # NOTE(yxing): plt-related config
+        self.plt_loop_nums = self.model_config.get_plt_num_loops()
+        if self.plt_loop_nums > 1:
+            self.plt_loop_hidden_states = torch.zeros(
+                self.plt_loop_nums,
+                self.max_num_tokens,
+                self.model_config.get_hidden_size(),
+                device=self.device,
+                dtype=torch.bfloat16,
+            )
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -1451,6 +1463,58 @@ class GPUModelRunner(
             dim=0,
             index=draft_tokens_index_tensor,
             src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
+        )
+
+    def _prepare_loop_hidden_states(
+        self,
+        schedule_tokens_np: np.ndarray,
+        model_kwargs: dict,
+        plt_loop_num_idx: int,
+        prev_model_output: torch.Tensor,
+        num_tokens_padded: int,
+    ):
+        if plt_loop_num_idx == 0:
+            model_kwargs["loop_hidden_states"] = None
+            return
+
+        # [A, B, C, D, E, F, G] [H, I, J, K]
+        # [0, A, B, C, D, E, F] [G, H, I, J]
+        schedule_tokens_cumsum = np.cumsum(schedule_tokens_np)
+        for req_idx, req_sched_tokens in enumerate(schedule_tokens_np):
+            token_end = schedule_tokens_cumsum[req_idx]
+            token_start = token_end - req_sched_tokens + 1
+            if req_sched_tokens > 1:
+                self.plt_loop_hidden_states[plt_loop_num_idx][token_start:token_end] = (
+                    prev_model_output[token_start - 1 : token_end - 1]
+                )
+        model_kwargs["loop_hidden_states"] = self.plt_loop_hidden_states[
+            plt_loop_num_idx
+        ][:num_tokens_padded]
+
+    def _fill_first_hidden_state_for_plt(self, schedule_tokens_np: np.ndarray):
+        schedule_tokens_cumsum = np.cumsum(schedule_tokens_np)
+        for plt_loop_num_idx in range(1, self.plt_loop_nums):
+            # check the first token
+            for req_idx, req_sched_tokens in enumerate(schedule_tokens_np):
+                token_end = schedule_tokens_cumsum[req_idx]
+                token_start = token_end - req_sched_tokens
+                self.plt_loop_hidden_states[plt_loop_num_idx][token_start] = (
+                    self.input_batch.plt_saved_hidden_states[plt_loop_num_idx - 1][
+                        req_idx
+                    ]
+                )
+
+    def _update_saved_hidden_states(
+        self,
+        model_output: torch.Tensor,
+        schedule_tokens_np: np.ndarray,
+        plt_loop_num_idx: int,
+    ):
+        assert self.plt_loop_nums > 1
+        token_cusum = np.cumsum(schedule_tokens_np)
+        num_seqs = len(schedule_tokens_np)
+        self.input_batch.plt_saved_hidden_states[plt_loop_num_idx][:num_seqs] = (
+            model_output[token_cusum - 1]
         )
 
     def _get_encoder_seq_lens(
@@ -3585,13 +3649,58 @@ class GPUModelRunner(
                 scheduler_output, clear_metadata=clear_kv_metadata
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            if self.plt_loop_nums > 1:
+                plt_last_model_output = None
+                # NOTE(yxing): this is a naive plt implementation
+                self._fill_first_hidden_state_for_plt(
+                    schedule_tokens_np=num_scheduled_tokens_np
+                )
+                ctx = get_forward_context()
+                for plt_loop_num_idx in range(self.plt_loop_nums):
+                    model_kwargs["loop_num_idx"] = plt_loop_num_idx
+                    self._prepare_loop_hidden_states(
+                        schedule_tokens_np=num_scheduled_tokens_np,
+                        model_kwargs=model_kwargs,
+                        plt_loop_num_idx=plt_loop_num_idx,
+                        prev_model_output=plt_last_model_output,
+                        num_tokens_padded=num_tokens_padded,
+                    )
+                    # Each PLT loop iteration re-traverses all MoE layers, so
+                    # reset the index so the custom ops index all_moe_layers
+                    # from the beginning again.
+                    ctx.moe_layer_index = 0
+                    # For FULL CG mode, update batch_descriptor so each PLT
+                    # iteration replays its own captured graph.
+                    ctx.batch_descriptor = replace(
+                        batch_desc, plt_loop_num_idx=plt_loop_num_idx
+                    )
+                    ctx.skip_compiled = True
+
+                    model_output = self._model_forward(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
+                    # for non-last loop, we save the hidden states for next loop
+                    if plt_loop_num_idx < self.plt_loop_nums - 1:
+                        torch.cuda.synchronize()
+                        self._update_saved_hidden_states(
+                            model_output=model_output,
+                            schedule_tokens_np=num_scheduled_tokens_np,
+                            plt_loop_num_idx=plt_loop_num_idx,
+                        )
+                    plt_last_model_output = model_output
+
+            else:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4928,13 +5037,40 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
-                outputs = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
+                if self.plt_loop_nums > 1:
+                    ctx = get_forward_context()
+
+                    for plt_loop_num_idx in range(self.plt_loop_nums):
+                        model_kwargs["loop_num_idx"] = plt_loop_num_idx
+                        ctx.moe_layer_index = 0
+                        ctx.batch_descriptor = replace(
+                            batch_desc, plt_loop_num_idx=plt_loop_num_idx
+                        )
+                        ctx.skip_compiled = True
+
+                        model_kwargs["loop_hidden_states"] = (
+                            None
+                            if plt_loop_num_idx == 0
+                            else self.plt_loop_hidden_states[plt_loop_num_idx][
+                                :num_tokens_padded
+                            ]
+                        )
+
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            positions=positions,
+                            intermediate_tensors=intermediate_tensors,
+                            inputs_embeds=inputs_embeds,
+                            **model_kwargs,
+                        )
+                else:
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -5803,6 +5939,8 @@ class GPUModelRunner(
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
+                plt_hidden_size=self.model_config.get_hidden_size(),
+                plt_loop_nums=self.plt_loop_nums,
             )
 
     def _allocate_kv_cache_tensors(

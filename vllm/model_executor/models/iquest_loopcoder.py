@@ -71,6 +71,8 @@ class LoopCoderAttention(nn.Module):
         attn_type: str = AttentionType.DECODER,
         dual_chunk_attention_config: dict[str, Any] | None = None,
         layer_idx: int = 0,
+        plt_window_size: int = -1,
+        plt_loop_nums: int = 0,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -97,8 +99,12 @@ class LoopCoderAttention(nn.Module):
 
         # Get loop_num from config, default to 2 if not specified
         self.loop_num = getattr(config, "loop_num", 2)
+        if plt_loop_nums:
+            self.loop_num = plt_loop_nums
 
         self.loop_window_size = getattr(config, "loop_window_size", 64)
+        if plt_window_size != -1:
+            self.loop_window_size = plt_window_size
 
         # Use total number of hidden layers instead of hardcoded 24
         total_layers = config.num_hidden_layers
@@ -177,6 +183,7 @@ class LoopCoderAttention(nn.Module):
         hidden_states: torch.Tensor,
         loop_idx: int,
         gate_proj: LoopGateProjection | None = None,
+        gate_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if loop_idx == 0:
             attn = self.attn[0]
@@ -201,7 +208,7 @@ class LoopCoderAttention(nn.Module):
             global_attn_output = global_attn(q, None, None)
             local_attn_output = local_attn(q, k, v)
             assert gate_proj is not None, "gate_proj must be provided for loop_idx > 0"
-            gate = gate_proj(q_reshaped)
+            gate = gate_proj(q_reshaped, hidden_states=gate_hidden_states)
             output = global_attn_output * gate + local_attn_output * (1 - gate)
             output, _ = self.o_proj(output)
             return output
@@ -215,6 +222,8 @@ class LoopCoderDecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         layer_idx: int = 0,
+        plt_window_size: int = -1,
+        plt_loop_nums: int = 0,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -239,6 +248,8 @@ class LoopCoderDecoderLayer(nn.Module):
             attn_type=attn_type,
             dual_chunk_attention_config=dual_chunk_attention_config,
             layer_idx=self.layer_idx,
+            plt_window_size=plt_window_size,
+            plt_loop_nums=plt_loop_nums,
         )
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
@@ -259,6 +270,8 @@ class LoopCoderDecoderLayer(nn.Module):
         loop_idx: int,
         gate_proj: LoopGateProjection | None = None,
     ) -> torch.Tensor:
+        # residual = pre-layernorm hidden_states, corresponds to training's
+        # gate_hidden_states saved in PLTLayer._preprocess before input_layernorm
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
@@ -266,6 +279,7 @@ class LoopCoderDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             loop_idx=loop_idx,
             gate_proj=gate_proj,
+            gate_hidden_states=residual,
         )
         hidden_states = hidden_states + residual
         residual = hidden_states
@@ -294,6 +308,9 @@ class LoopGateProjection(nn.Module):
         head_dim: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        use_hidden_states=False,
+        rms_norm_eps: float = 1e-6,
+        hidden_size: int = 0,
     ):
         super().__init__()
         self.total_num_heads = total_num_heads
@@ -301,29 +318,71 @@ class LoopGateProjection(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
+        self.use_hidden_states = use_hidden_states
 
-        self.gate_proj = ColumnParallelLinear(
-            head_dim,
-            self.total_num_heads,
-            bias=True,
-            gather_output=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_proj",
-        )
+        if self.use_hidden_states:
+            # Hidden-states mode: gate = sigmoid(linear(norm(hidden_states)))
+            # Matches training: plt_attention.py LoopGateProjection with
+            # plt_gate_use_hidden_states=True
+            self.gate_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+            self.gate_proj = ColumnParallelLinear(
+                hidden_size,
+                self.total_num_heads,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_proj",
+            )
+        else:
+            self.gate_proj = ColumnParallelLinear(
+                head_dim,
+                self.total_num_heads,
+                bias=True,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.gate_proj",
+            )
 
-    def forward(self, query: torch.Tensor) -> torch.Tensor:
-        """Compute gate values from query tensor.
+    def forward(
+        self,
+        query: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute gate values.
 
         Args:
-            query: [num_heads, num_tokens, head_dim] (vLLM flattened format)
-                where num_heads is the number of heads on this TP rank
-                and num_tokens = batch * seq_len
+            query: [num_heads, num_tokens, head_dim] — used for computation
+                in query-based mode, used only for shape in hidden_states mode
+            hidden_states: [num_tokens, hidden_size] — pre-layernorm hidden
+                states, required when use_hidden_states=True
 
         Returns:
-            gate: [num_tokens, num_heads * head_dim] (flattened format matching q shape)
+            gate: [num_tokens, num_heads * head_dim]
         """
         num_heads, num_tokens, head_dim = query.shape
 
+        if self.use_hidden_states:
+            # Training equivalent (plt_attention.py:113-124):
+            #   x = gate_norm(hidden_states)
+            #   gate_logits = matmul(x, weight.t()) + bias
+            #   gate = sigmoid(gate_logits)
+            assert hidden_states is not None, (
+                "hidden_states required when use_hidden_states=True"
+            )
+            x = self.gate_norm(hidden_states)  # [num_tokens, hidden_size]
+            gate_logits, _ = self.gate_proj(x)  # [num_tokens, num_heads]
+            gate = torch.sigmoid(gate_logits)  # [num_tokens, num_heads]
+            # Expand to match attention output shape
+            gate = gate.unsqueeze(-1)  # [num_tokens, num_heads, 1]
+            gate = gate.expand(-1, -1, head_dim)  # [num_tokens, num_heads, head_dim]
+            gate = gate.reshape(
+                num_tokens, num_heads * head_dim
+            )  # [num_tokens, num_heads * head_dim]
+            return gate
+
+        # Query-based mode: per-head dot product via ColumnParallelLinear
+        # + diagonal extraction (mathematically equivalent to training's
+        # einsum('...hd,hd->...h', query, weight))
         assert num_heads == self.num_heads, (
             f"Expected {self.num_heads} heads, got {num_heads}"
         )
@@ -407,6 +466,14 @@ class IQuestLoopCoderModel(nn.Module):
         self.loop_num = getattr(self.config, "loop_num", 2)
         self.window_size = getattr(self.config, "loop_window_size", 64)
 
+        # NOTE(yxing): plt-releted config
+        model_config = vllm_config.model_config
+        self.plt_loop_nums = model_config.get_plt_num_loops()
+        self.plt_emb_scale = model_config.get_plt_emb_scale()
+        self.plt_hidden_scale = model_config.get_plt_hidden_scale()
+        self.plt_normalize_per_loop = model_config.get_plt_normalize_per_loop()
+        self.plt_gate_use_hidden_states = model_config.get_plt_gate_use_hidden_states()
+
         # Gate projections for Loop 2+ (one per layer)
         head_dim = config.hidden_size // config.num_attention_heads
         _, _, self.gate_projections = make_layers(
@@ -416,10 +483,14 @@ class IQuestLoopCoderModel(nn.Module):
                 head_dim=head_dim,
                 quant_config=quant_config,
                 prefix=prefix,
+                rms_norm_eps=config.rms_norm_eps,
+                use_hidden_states=self.plt_gate_use_hidden_states,
+                hidden_size=config.hidden_size,
             ),
             prefix=f"{prefix}.gate_projections",
         )
 
+        plt_window_size = model_config.get_plt_window_size()
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: LoopCoderDecoderLayer(
@@ -428,6 +499,8 @@ class IQuestLoopCoderModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 layer_idx=extract_layer_index(prefix),
+                plt_window_size=plt_window_size,
+                plt_loop_nums=self.plt_loop_nums,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -442,13 +515,22 @@ class IQuestLoopCoderModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        loop_num_idx: int = 0,
+        loop_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_input_ids(input_ids)
 
-        for loop_idx in range(self.loop_num):
+        # NOTE(yxing): process inputs
+        if self.plt_loop_nums > 1:
+            if loop_hidden_states is not None:
+                hidden_states = (
+                    self.plt_emb_scale * hidden_states
+                    + self.plt_hidden_scale * loop_hidden_states
+                )
+
             for layer_idx, layer in enumerate(
                 self.layers[self.start_layer : self.end_layer]
             ):
@@ -456,10 +538,33 @@ class IQuestLoopCoderModel(nn.Module):
                 actual_layer_idx = self.start_layer + layer_idx
                 # Get gate_proj for this layer (only for loop_idx > 0)
                 gate_proj = (
-                    self.gate_projections[actual_layer_idx] if loop_idx > 0 else None
+                    self.gate_projections[actual_layer_idx]
+                    if loop_num_idx > 0
+                    else None
                 )
-                hidden_states = layer(positions, hidden_states, loop_idx, gate_proj)
-        hidden_states = self.norm(hidden_states)
+                hidden_states = layer(positions, hidden_states, loop_num_idx, gate_proj)
+
+            if loop_num_idx < self.plt_loop_nums - 1 and self.plt_normalize_per_loop:
+                hidden_states = self.norm(hidden_states)
+
+            if loop_num_idx == self.plt_loop_nums - 1:
+                hidden_states = self.norm(hidden_states)
+
+        else:
+            for loop_idx in range(self.loop_num):
+                for layer_idx, layer in enumerate(
+                    self.layers[self.start_layer : self.end_layer]
+                ):
+                    # Get the actual layer index (accounting for pipeline parallelism)
+                    actual_layer_idx = self.start_layer + layer_idx
+                    # Get gate_proj for this layer (only for loop_idx > 0)
+                    gate_proj = (
+                        self.gate_projections[actual_layer_idx]
+                        if loop_idx > 0
+                        else None
+                    )
+                    hidden_states = layer(positions, hidden_states, loop_idx, gate_proj)
+            hidden_states = self.norm(hidden_states)
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -491,7 +596,7 @@ class IQuestLoopCoderModel(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "gate_projections" in name:
                     continue
-                if weight_name not in name:
+                if weight_name not in name or "loop" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
@@ -527,6 +632,43 @@ class IQuestLoopCoderModel(nn.Module):
                         loaded_params.add(vllm_name)
                         continue
                     continue
+
+                # NOTE(yxing): for plt model, the loop gate proj name:
+                # layers.0.self_attn.loop_gate_proj.weight
+                #            or
+                # layers.0.self_attn.plt_gate.weight
+                #        -> gate_projections.0.gate_proj.weight
+                #
+                # layers.0.self_attn.loop_gate_proj.bias
+                #            or
+                # layers.0.self_attn.plt_gate.bias
+                #        -> gate_projections.0.gate_proj.bias
+                #
+                # layers.0.self_attn.loop_gate_proj.gate_norm.weight
+                #            or
+                # layers.0.self_attn.plt_gate.gate_norm.weight
+                #        -> gate_projections.0.gate_norm.weight
+                if any(k in name for k in ("loop_gate_proj", "plt_gate")):
+                    parts = name.split(".")
+                    layer_idx = parts[1]
+                    # Handle gate_norm sub-module:
+                    # layers.{idx}.self_attn.loop_gate_proj.gate_norm.weight
+                    if "gate_norm" in name:
+                        subpath = ".".join(parts[4:])  # gate_norm.weight
+                        vllm_name = f"gate_projections.{layer_idx}.{subpath}"
+                    else:
+                        subname = parts[4]  # weight or bias
+                        vllm_name = f"gate_projections.{layer_idx}.gate_proj.{subname}"
+                    if vllm_name not in params_dict:
+                        continue
+                    param = params_dict[vllm_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param=param, loaded_weight=loaded_weight)
+                    loaded_params.add(vllm_name)
+                    continue
+
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 # Remapping the name of FP8 kv-scale.
@@ -574,9 +716,16 @@ class IQuestLoopCoderForCausalLM(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        loop_num_idx: int = 0,
+        loop_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            loop_num_idx=loop_num_idx,
+            loop_hidden_states=loop_hidden_states,
         )
         return hidden_states
 
